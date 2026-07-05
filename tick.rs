@@ -15,19 +15,22 @@
 // Compile:
 //   rustc tick.rs -O -o tick
 //
-// Run:
+// Single symbol:
 //   ./tick --symbol BTCUSDT --start 2026-07-01 --end 2026-07-01 --out input-bn.txt
 //
 // Multi-symbol:
 //   ./tick --symbols BTCUSDT,ETHUSDT,SOLUSDT --start 2026-07-01 --end 2026-07-03 --out input-bn.txt
 //
+// All symbols/assets discovered from Binance public-data directory:
+//   ./tick --all-assets --start 2026-07-01 --end 2026-07-01 --out input-bn.txt --resume
+//
 // Resume + checksum:
-//   ./tick --symbol BTCUSDT --start 2026-07-01 --end 2026-07-10 --out input-bn.txt --resume --verify
+//   ./tick --all-assets --start 2026-07-01 --end 2026-07-10 --out input-bn.txt --resume --verify
 
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +42,8 @@ const DEFAULT_OUT: &str = "input-bn.txt";
 struct Args {
     symbol: String,
     symbols: Option<String>,
+    all_assets: bool,
+    max_symbols: usize,
     start: String,
     end: String,
     out: PathBuf,
@@ -64,7 +69,7 @@ struct AggTrade {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  tick --symbol BTCUSDT --start YYYY-MM-DD --end YYYY-MM-DD [--out input-bn.txt]\n\nOptions:\n  --symbol SYMBOL             Single symbol, default BTCUSDT\n  --symbols A,B,C             Comma-separated symbols; overrides --symbol\n  --start YYYY-MM-DD          Start date, required\n  --end YYYY-MM-DD            End date, required\n  --out PATH                  Output JSONL file, default input-bn.txt\n  --append                    Append to output\n  --resume                    Append and skip existing (s,a) keys\n  --verify                    Verify .CHECKSUM if available\n  --max-rows N                0 = unlimited\n  --tmp-dir PATH              Temp directory, default OS temp\n  --keep-zip                  Keep downloaded zip files\n\nOutput JSONL row, exactly 8 fields:\n  {\"s\":\"BTCUSDT\",\"a\":5933014,\"p\":\"0.001\",\"q\":\"100\",\"f\":100,\"l\":105,\"T\":123456785,\"m\":true}\n"
+        "Usage:\n  tick --symbol BTCUSDT --start YYYY-MM-DD --end YYYY-MM-DD [--out input-bn.txt]\n  tick --symbols BTCUSDT,ETHUSDT --start YYYY-MM-DD --end YYYY-MM-DD [--out input-bn.txt]\n  tick --all-assets --start YYYY-MM-DD --end YYYY-MM-DD [--out input-bn.txt]\n\nOptions:\n  --symbol SYMBOL             Single symbol, default BTCUSDT\n  --symbols A,B,C             Comma-separated symbols; overrides --symbol\n  --all-assets                Discover and download every symbol directory under Binance UM futures aggTrades\n  --max-symbols N             0 = unlimited; useful for testing --all-assets\n  --start YYYY-MM-DD          Start date, required\n  --end YYYY-MM-DD            End date, required\n  --out PATH                  Output JSONL file, default input-bn.txt\n  --append                    Append to output\n  --resume                    Append and skip existing (s,a) keys\n  --verify                    Verify .CHECKSUM if available\n  --max-rows N                0 = unlimited\n  --tmp-dir PATH              Temp directory, default OS temp\n  --keep-zip                  Keep downloaded zip files\n\nOutput JSONL row, exactly 8 fields:\n  {\"s\":\"BTCUSDT\",\"a\":5933014,\"p\":\"0.001\",\"q\":\"100\",\"f\":100,\"l\":105,\"T\":123456785,\"m\":true}\n"
     );
 }
 
@@ -83,10 +88,10 @@ fn parse_args() -> Result<Args, String> {
         }
 
         match arg.as_str() {
-            "--append" | "--resume" | "--verify" | "--keep-zip" => {
+            "--append" | "--resume" | "--verify" | "--keep-zip" | "--all-assets" => {
                 flags.insert(arg.trim_start_matches("--").to_string());
             }
-            "--symbol" | "--symbols" | "--start" | "--end" | "--out" | "--max-rows" | "--tmp-dir" => {
+            "--symbol" | "--symbols" | "--start" | "--end" | "--out" | "--max-rows" | "--tmp-dir" | "--max-symbols" => {
                 let Some(v) = it.next() else {
                     return Err(format!("missing value after {arg}"));
                 };
@@ -109,6 +114,12 @@ fn parse_args() -> Result<Args, String> {
         .parse::<usize>()
         .map_err(|e| format!("bad --max-rows: {e}"))?;
 
+    let max_symbols = kv
+        .remove("max-symbols")
+        .unwrap_or_else(|| "0".to_string())
+        .parse::<usize>()
+        .map_err(|e| format!("bad --max-symbols: {e}"))?;
+
     let tmp_dir = kv
         .remove("tmp-dir")
         .map(PathBuf::from)
@@ -117,6 +128,8 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         symbol: kv.remove("symbol").unwrap_or_else(|| "BTCUSDT".to_string()).to_ascii_uppercase(),
         symbols: kv.remove("symbols"),
+        all_assets: flags.contains("all-assets"),
+        max_symbols,
         start,
         end,
         out: PathBuf::from(kv.remove("out").unwrap_or_else(|| DEFAULT_OUT.to_string())),
@@ -127,17 +140,6 @@ fn parse_args() -> Result<Args, String> {
         tmp_dir,
         max_rows,
     })
-}
-
-fn parse_symbols(args: &Args) -> Vec<String> {
-    if let Some(list) = &args.symbols {
-        list.split(',')
-            .map(|s| s.trim().to_ascii_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        vec![args.symbol.trim().to_ascii_uppercase()]
-    }
 }
 
 fn parse_bool(x: &str) -> Result<bool, String> {
@@ -236,11 +238,7 @@ fn download_to_file(url: &str, dest: &Path) -> Result<bool, String> {
         .status()
         .map_err(|e| format!("failed to launch curl; install curl first: {e}"))?;
 
-    if status.success() {
-        Ok(true)
-    } else {
-        Ok(false)
-    }
+    if status.success() { Ok(true) } else { Ok(false) }
 }
 
 fn curl_text(url: &str) -> Result<Option<String>, String> {
@@ -257,9 +255,7 @@ fn curl_text(url: &str) -> Result<Option<String>, String> {
 
 fn command_output_first_word(cmd: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(cmd).args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
+    if !output.status.success() { return None; }
     String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .next()
@@ -268,12 +264,8 @@ fn command_output_first_word(cmd: &str, args: &[&str]) -> Option<String> {
 
 fn sha256_file(path: &Path) -> Result<Option<String>, String> {
     let p = path.to_string_lossy().to_string();
-    if let Some(x) = command_output_first_word("sha256sum", &[&p]) {
-        return Ok(Some(x));
-    }
-    if let Some(x) = command_output_first_word("shasum", &["-a", "256", &p]) {
-        return Ok(Some(x));
-    }
+    if let Some(x) = command_output_first_word("sha256sum", &[&p]) { return Ok(Some(x)); }
+    if let Some(x) = command_output_first_word("shasum", &["-a", "256", &p]) { return Ok(Some(x)); }
     Ok(None)
 }
 
@@ -304,10 +296,112 @@ fn verify_checksum(zip_url: &str, zip_path: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
-fn is_header(cols: &[&str]) -> bool {
-    if cols.is_empty() {
-        return true;
+fn is_valid_symbol_dir(s: &str) -> bool {
+    let n = s.len();
+    if n < 3 || n > 40 { return false; }
+    s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+fn add_symbol_candidate(set: &mut HashSet<String>, raw: &str) {
+    let mut s = raw.trim().trim_matches('/').to_ascii_uppercase();
+    if let Some(pos) = s.find('/') {
+        s = s[..pos].to_string();
     }
+    if is_valid_symbol_dir(&s) {
+        set.insert(s);
+    }
+}
+
+fn extract_href_targets(html: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = html;
+    loop {
+        let Some(i) = rest.find("href=") else { break; };
+        rest = &rest[i + 5..];
+        let bytes = rest.as_bytes();
+        if bytes.is_empty() { break; }
+        let quote = bytes[0] as char;
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        let after = &rest[1..];
+        let Some(j) = after.find(quote) else { break; };
+        out.push(after[..j].to_string());
+        rest = &after[j + 1..];
+    }
+    out
+}
+
+fn discover_all_symbols(max_symbols: usize) -> Result<Vec<String>, String> {
+    let url = format!("{BASE_URL}/");
+    let Some(html) = curl_text(&url)? else {
+        return Err(format!("cannot fetch symbol index: {url}"));
+    };
+
+    let mut set: HashSet<String> = HashSet::new();
+
+    // Case 1: ordinary directory links such as href="BTCUSDT/".
+    for href in extract_href_targets(&html) {
+        let href = href.trim();
+        if href.ends_with('/') {
+            let last = href.trim_end_matches('/').rsplit('/').next().unwrap_or(href);
+            add_symbol_candidate(&mut set, last);
+        }
+        // Case 2: links with prefix query path.
+        let marker = "daily/aggTrades/";
+        if let Some(i) = href.find(marker) {
+            let tail = &href[i + marker.len()..];
+            add_symbol_candidate(&mut set, tail);
+        }
+        let marker2 = "daily%2FaggTrades%2F";
+        if let Some(i) = href.find(marker2) {
+            let tail = &href[i + marker2.len()..];
+            let tail = tail.split('%').next().unwrap_or(tail);
+            add_symbol_candidate(&mut set, tail);
+        }
+    }
+
+    // Case 3: raw text contains path fragments.
+    let marker = "/data/futures/um/daily/aggTrades/";
+    let mut rest = html.as_str();
+    while let Some(i) = rest.find(marker) {
+        rest = &rest[i + marker.len()..];
+        let token: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+        add_symbol_candidate(&mut set, &token);
+    }
+
+    let mut symbols: Vec<String> = set.into_iter().collect();
+    symbols.sort();
+    if max_symbols > 0 && symbols.len() > max_symbols {
+        symbols.truncate(max_symbols);
+    }
+    if symbols.is_empty() {
+        return Err("--all-assets found zero symbols; directory format may have changed".to_string());
+    }
+    Ok(symbols)
+}
+
+fn select_symbols(args: &Args) -> Result<Vec<String>, String> {
+    if args.all_assets {
+        let symbols = discover_all_symbols(args.max_symbols)?;
+        println!("[DISCOVER] all-assets symbols={}", symbols.len());
+        return Ok(symbols);
+    }
+    if let Some(list) = &args.symbols {
+        let mut out: Vec<String> = list
+            .split(',')
+            .map(|s| s.trim().to_ascii_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        out.sort();
+        out.dedup();
+        return Ok(out);
+    }
+    Ok(vec![args.symbol.trim().to_ascii_uppercase()])
+}
+
+fn is_header(cols: &[&str]) -> bool {
+    if cols.is_empty() { return true; }
     let head = cols[0].trim().to_ascii_lowercase();
     head.starts_with("aggregate")
         || head == "agg_trade_id"
@@ -318,16 +412,12 @@ fn is_header(cols: &[&str]) -> bool {
 
 fn parse_aggtrade_row(symbol: &str, line: &str) -> Result<Option<AggTrade>, String> {
     let line = line.trim();
-    if line.is_empty() {
-        return Ok(None);
-    }
+    if line.is_empty() { return Ok(None); }
 
-    // Binance aggTrades rows are simple CSV values: a,p,q,f,l,T,m
-    // No quoted fields are expected for this market data file.
+    // Binance aggTrades rows are simple CSV values: a,p,q,f,l,T,m.
+    // No quoted fields are expected for this market-data file.
     let cols: Vec<&str> = line.split(',').collect();
-    if is_header(&cols) {
-        return Ok(None);
-    }
+    if is_header(&cols) { return Ok(None); }
     if cols.len() < 7 {
         return Err(format!("bad row length={} row={line:?}", cols.len()));
     }
@@ -340,16 +430,7 @@ fn parse_aggtrade_row(symbol: &str, line: &str) -> Result<Option<AggTrade>, Stri
     let t = cols[5].trim().parse::<i64>().map_err(|e| format!("bad T={:?}: {e}", cols[5]))?;
     let m = parse_bool(cols[6])?;
 
-    Ok(Some(AggTrade {
-        s: symbol.to_string(),
-        a,
-        p,
-        q,
-        f,
-        l,
-        t,
-        m,
-    }))
+    Ok(Some(AggTrade { s: symbol.to_string(), a, p, q, f, l, t, m }))
 }
 
 fn json_escape(s: &str) -> String {
@@ -397,46 +478,32 @@ fn extract_json_i64(line: &str, key: &str) -> Option<i64> {
     let rest = &line[start..];
     let mut end = 0usize;
     for (i, ch) in rest.char_indices() {
-        if !(ch == '-' || ch.is_ascii_digit()) {
-            break;
-        }
+        if !(ch == '-' || ch.is_ascii_digit()) { break; }
         end = i + ch.len_utf8();
     }
-    if end == 0 {
-        return None;
-    }
+    if end == 0 { return None; }
     rest[..end].parse::<i64>().ok()
 }
 
 fn load_seen_keys(out_path: &Path) -> HashSet<(String, i64)> {
     let mut seen = HashSet::new();
-    let Ok(file) = File::open(out_path) else {
-        return seen;
-    };
+    let Ok(file) = File::open(out_path) else { return seen; };
     let reader = BufReader::new(file);
     for line in reader.lines().flatten() {
-        let Some(s) = extract_json_string(&line, "s") else {
-            continue;
-        };
-        let Some(a) = extract_json_i64(&line, "a") else {
-            continue;
-        };
+        let Some(s) = extract_json_string(&line, "s") else { continue; };
+        let Some(a) = extract_json_i64(&line, "a") else { continue; };
         seen.insert((s, a));
     }
     seen
 }
 
 fn unzip_csv_stream(zip_path: &Path) -> Result<std::process::Child, String> {
-    let mut child = Command::new("unzip")
+    let child = Command::new("unzip")
         .arg("-p")
         .arg(zip_path)
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to launch unzip; install unzip first: {e}"))?;
-
-    if child.stdout.is_none() {
-        return Err("unzip stdout unavailable".to_string());
-    }
     Ok(child)
 }
 
@@ -457,13 +524,9 @@ fn process_zip(
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("read unzip line failed: {e}"))?;
-        let Some(item) = parse_aggtrade_row(symbol, &line)? else {
-            continue;
-        };
+        let Some(item) = parse_aggtrade_row(symbol, &line)? else { continue; };
         let key = (item.s.clone(), item.a);
-        if seen.contains(&key) {
-            continue;
-        }
+        if seen.contains(&key) { continue; }
 
         writeln!(out, "{}", to_json_line(&item)).map_err(|e| format!("write output failed: {e}"))?;
         seen.insert(key);
@@ -486,7 +549,7 @@ fn process_zip(
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let symbols = parse_symbols(&args);
+    let symbols = select_symbols(&args)?;
     let days = date_range(&args.start, &args.end)?;
 
     fs::create_dir_all(&args.tmp_dir).map_err(|e| format!("create tmp dir failed {:?}: {e}", args.tmp_dir))?;
@@ -503,8 +566,11 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("open output failed {:?}: {e}", args.out))?;
 
     let mut total = 0usize;
+    let mut assets_ok = 0usize;
+    let mut assets_empty = 0usize;
 
     for symbol in symbols {
+        let mut symbol_rows = 0usize;
         for day in &days {
             let url = make_url(&symbol, day);
             let zip_path = args.tmp_dir.join(format!("tick-{symbol}-{day}-{}.zip", now_ms()));
@@ -530,21 +596,22 @@ fn run() -> Result<(), String> {
                 &mut total,
                 args.max_rows,
             )?;
+            symbol_rows += day_count;
 
             println!("[OK] {symbol} {day} rows={day_count}");
 
-            if !args.keep_zip {
-                let _ = fs::remove_file(&zip_path);
-            }
+            if !args.keep_zip { let _ = fs::remove_file(&zip_path); }
 
             if hit_limit {
                 println!("[DONE] max rows reached: {total}");
                 return Ok(());
             }
         }
+        if symbol_rows > 0 { assets_ok += 1; } else { assets_empty += 1; }
+        println!("[ASSET] {symbol} total_rows={symbol_rows}");
     }
 
-    println!("[DONE] wrote rows={total} file={:?}", args.out);
+    println!("[DONE] wrote rows={total} file={:?} assets_ok={assets_ok} assets_empty={assets_empty}", args.out);
     Ok(())
 }
 
