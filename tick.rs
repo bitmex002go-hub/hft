@@ -2,9 +2,12 @@
 // tick.rs
 // E2E single-file Rust loader for Binance USD-M Futures offline aggTrades.
 //
-// Purpose:
-//   Download Binance public offline aggTrades and write JSONL rows to input-bn.txt.
-//   Output schema is exactly 8 fields in this order:
+// Default behavior:
+//   ./tick
+// means:
+//   all USD-M futures assets, yesterday UTC, output input-bn.txt
+//
+// Output schema is exactly 8 fields, exactly this order:
 //   s,a,p,q,f,l,T,m
 //
 // No Cargo.toml is required. This file uses Rust std only, and calls system tools:
@@ -15,17 +18,17 @@
 // Compile:
 //   rustc tick.rs -O -o tick
 //
+// Default, all assets, yesterday UTC:
+//   ./tick
+//
+// Explicit all assets and date:
+//   ./tick --all-assets --start 2026-07-01 --end 2026-07-01 --out input-bn.txt --resume
+//
 // Single symbol:
 //   ./tick --symbol BTCUSDT --start 2026-07-01 --end 2026-07-01 --out input-bn.txt
 //
-// Multi-symbol:
-//   ./tick --symbols BTCUSDT,ETHUSDT,SOLUSDT --start 2026-07-01 --end 2026-07-03 --out input-bn.txt
-//
-// All symbols/assets discovered from Binance public-data directory:
-//   ./tick --all-assets --start 2026-07-01 --end 2026-07-01 --out input-bn.txt --resume
-//
-// Resume + checksum:
-//   ./tick --all-assets --start 2026-07-01 --end 2026-07-10 --out input-bn.txt --resume --verify
+// Test first 10 discovered symbols only:
+//   ./tick --all-assets --max-symbols 10
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -69,7 +72,7 @@ struct AggTrade {
 
 fn print_usage() {
     eprintln!(
-        "Usage:\n  tick --symbol BTCUSDT --start YYYY-MM-DD --end YYYY-MM-DD [--out input-bn.txt]\n  tick --symbols BTCUSDT,ETHUSDT --start YYYY-MM-DD --end YYYY-MM-DD [--out input-bn.txt]\n  tick --all-assets --start YYYY-MM-DD --end YYYY-MM-DD [--out input-bn.txt]\n\nOptions:\n  --symbol SYMBOL             Single symbol, default BTCUSDT\n  --symbols A,B,C             Comma-separated symbols; overrides --symbol\n  --all-assets                Discover and download every symbol directory under Binance UM futures aggTrades\n  --max-symbols N             0 = unlimited; useful for testing --all-assets\n  --start YYYY-MM-DD          Start date, required\n  --end YYYY-MM-DD            End date, required\n  --out PATH                  Output JSONL file, default input-bn.txt\n  --append                    Append to output\n  --resume                    Append and skip existing (s,a) keys\n  --verify                    Verify .CHECKSUM if available\n  --max-rows N                0 = unlimited\n  --tmp-dir PATH              Temp directory, default OS temp\n  --keep-zip                  Keep downloaded zip files\n\nOutput JSONL row, exactly 8 fields:\n  {\"s\":\"BTCUSDT\",\"a\":5933014,\"p\":\"0.001\",\"q\":\"100\",\"f\":100,\"l\":105,\"T\":123456785,\"m\":true}\n"
+        "Usage:\n  tick [defaults: --all-assets --start yesterday-UTC --end yesterday-UTC --out input-bn.txt]\n  tick --symbol BTCUSDT --start YYYY-MM-DD --end YYYY-MM-DD\n  tick --symbols BTCUSDT,ETHUSDT --start YYYY-MM-DD --end YYYY-MM-DD\n  tick --all-assets --start YYYY-MM-DD --end YYYY-MM-DD\n\nOptions:\n  --symbol SYMBOL             Single symbol. Passing this disables default all-assets unless --all-assets is also passed.\n  --symbols A,B,C             Comma-separated symbols. Passing this disables default all-assets unless --all-assets is also passed.\n  --all-assets                Discover and download every symbol directory under Binance UM futures aggTrades.\n  --max-symbols N             0 = unlimited; useful for testing --all-assets.\n  --start YYYY-MM-DD          Start date. Default = yesterday UTC.\n  --end YYYY-MM-DD            End date. Default = start date, or yesterday UTC when start is omitted.\n  --out PATH                  Output JSONL file, default input-bn.txt.\n  --append                    Append to output.\n  --resume                    Append and skip existing (s,a) keys.\n  --verify                    Verify .CHECKSUM if available.\n  --max-rows N                0 = unlimited.\n  --tmp-dir PATH              Temp directory, default OS temp.\n  --keep-zip                  Keep downloaded zip files.\n\nOutput JSONL row, exactly 8 fields:\n  {\"s\":\"BTCUSDT\",\"a\":5933014,\"p\":\"0.001\",\"q\":\"100\",\"f\":100,\"l\":105,\"T\":123456785,\"m\":true}\n"
     );
 }
 
@@ -86,7 +89,6 @@ fn parse_args() -> Result<Args, String> {
         if !arg.starts_with("--") {
             return Err(format!("unexpected positional argument: {arg}"));
         }
-
         match arg.as_str() {
             "--append" | "--resume" | "--verify" | "--keep-zip" | "--all-assets" => {
                 flags.insert(arg.trim_start_matches("--").to_string());
@@ -101,11 +103,15 @@ fn parse_args() -> Result<Args, String> {
         }
     }
 
-    let Some(start) = kv.remove("start") else {
-        return Err("--start is required".to_string());
-    };
-    let Some(end) = kv.remove("end") else {
-        return Err("--end is required".to_string());
+    let explicit_symbol = kv.contains_key("symbol") || kv.contains_key("symbols");
+    let default_day = yesterday_utc_date();
+    let start_raw = kv.remove("start");
+    let end_raw = kv.remove("end");
+    let (start, end) = match (start_raw, end_raw) {
+        (Some(s), Some(e)) => (s, e),
+        (Some(s), None) => (s.clone(), s),
+        (None, Some(e)) => (e.clone(), e),
+        (None, None) => (default_day.clone(), default_day),
     };
 
     let max_rows = kv
@@ -128,7 +134,7 @@ fn parse_args() -> Result<Args, String> {
     Ok(Args {
         symbol: kv.remove("symbol").unwrap_or_else(|| "BTCUSDT".to_string()).to_ascii_uppercase(),
         symbols: kv.remove("symbols"),
-        all_assets: flags.contains("all-assets"),
+        all_assets: flags.contains("all-assets") || !explicit_symbol,
         max_symbols,
         start,
         end,
@@ -193,6 +199,16 @@ fn format_date(y: i64, m: i64, d: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+fn yesterday_utc_date() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let today_days = secs / 86_400;
+    let (y, m, d) = civil_from_days(today_days - 1);
+    format_date(y, m, d)
+}
+
 fn date_range(start: &str, end: &str) -> Result<Vec<String>, String> {
     let (sy, sm, sd) = parse_date(start)?;
     let (ey, em, ed) = parse_date(end)?;
@@ -223,22 +239,12 @@ fn now_ms() -> u128 {
 
 fn download_to_file(url: &str, dest: &Path) -> Result<bool, String> {
     let status = Command::new("curl")
-        .args([
-            "-fL",
-            "--retry",
-            "4",
-            "--connect-timeout",
-            "30",
-            "--max-time",
-            "300",
-            "-o",
-        ])
+        .args(["-fL", "--retry", "4", "--connect-timeout", "30", "--max-time", "300", "-o"])
         .arg(dest)
         .arg(url)
         .status()
         .map_err(|e| format!("failed to launch curl; install curl first: {e}"))?;
-
-    if status.success() { Ok(true) } else { Ok(false) }
+    Ok(status.success())
 }
 
 fn curl_text(url: &str) -> Result<Option<String>, String> {
@@ -246,7 +252,6 @@ fn curl_text(url: &str) -> Result<Option<String>, String> {
         .args(["-fL", "--retry", "2", "--connect-timeout", "20", "--max-time", "60", url])
         .output()
         .map_err(|e| format!("failed to launch curl; install curl first: {e}"))?;
-
     if !output.status.success() {
         return Ok(None);
     }
@@ -255,7 +260,9 @@ fn curl_text(url: &str) -> Result<Option<String>, String> {
 
 fn command_output_first_word(cmd: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(cmd).args(args).output().ok()?;
-    if !output.status.success() { return None; }
+    if !output.status.success() {
+        return None;
+    }
     String::from_utf8_lossy(&output.stdout)
         .split_whitespace()
         .next()
@@ -264,8 +271,12 @@ fn command_output_first_word(cmd: &str, args: &[&str]) -> Option<String> {
 
 fn sha256_file(path: &Path) -> Result<Option<String>, String> {
     let p = path.to_string_lossy().to_string();
-    if let Some(x) = command_output_first_word("sha256sum", &[&p]) { return Ok(Some(x)); }
-    if let Some(x) = command_output_first_word("shasum", &["-a", "256", &p]) { return Ok(Some(x)); }
+    if let Some(x) = command_output_first_word("sha256sum", &[&p]) {
+        return Ok(Some(x));
+    }
+    if let Some(x) = command_output_first_word("shasum", &["-a", "256", &p]) {
+        return Ok(Some(x));
+    }
     Ok(None)
 }
 
@@ -275,17 +286,14 @@ fn verify_checksum(zip_url: &str, zip_path: &Path) -> Result<bool, String> {
         eprintln!("[WARN] checksum missing: {checksum_url}");
         return Ok(true);
     };
-
     let Some(expected) = text.split_whitespace().next() else {
         eprintln!("[WARN] checksum empty: {checksum_url}");
         return Ok(true);
     };
-
     let Some(actual) = sha256_file(zip_path)? else {
         eprintln!("[WARN] sha256sum/shasum not found; skip checksum verification");
         return Ok(true);
     };
-
     let expected = expected.trim().to_ascii_lowercase();
     if expected != actual {
         eprintln!("[FAIL] checksum mismatch: {zip_url}");
@@ -298,7 +306,9 @@ fn verify_checksum(zip_url: &str, zip_path: &Path) -> Result<bool, String> {
 
 fn is_valid_symbol_dir(s: &str) -> bool {
     let n = s.len();
-    if n < 3 || n > 40 { return false; }
+    if n < 3 || n > 40 {
+        return false;
+    }
     s.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
 }
 
@@ -319,7 +329,9 @@ fn extract_href_targets(html: &str) -> Vec<String> {
         let Some(i) = rest.find("href=") else { break; };
         rest = &rest[i + 5..];
         let bytes = rest.as_bytes();
-        if bytes.is_empty() { break; }
+        if bytes.is_empty() {
+            break;
+        }
         let quote = bytes[0] as char;
         if quote != '"' && quote != '\'' {
             continue;
@@ -340,14 +352,12 @@ fn discover_all_symbols(max_symbols: usize) -> Result<Vec<String>, String> {
 
     let mut set: HashSet<String> = HashSet::new();
 
-    // Case 1: ordinary directory links such as href="BTCUSDT/".
     for href in extract_href_targets(&html) {
         let href = href.trim();
         if href.ends_with('/') {
             let last = href.trim_end_matches('/').rsplit('/').next().unwrap_or(href);
             add_symbol_candidate(&mut set, last);
         }
-        // Case 2: links with prefix query path.
         let marker = "daily/aggTrades/";
         if let Some(i) = href.find(marker) {
             let tail = &href[i + marker.len()..];
@@ -361,7 +371,6 @@ fn discover_all_symbols(max_symbols: usize) -> Result<Vec<String>, String> {
         }
     }
 
-    // Case 3: raw text contains path fragments.
     let marker = "/data/futures/um/daily/aggTrades/";
     let mut rest = html.as_str();
     while let Some(i) = rest.find(marker) {
@@ -376,7 +385,7 @@ fn discover_all_symbols(max_symbols: usize) -> Result<Vec<String>, String> {
         symbols.truncate(max_symbols);
     }
     if symbols.is_empty() {
-        return Err("--all-assets found zero symbols; directory format may have changed".to_string());
+        return Err("all-assets found zero symbols; Binance directory format may have changed".to_string());
     }
     Ok(symbols)
 }
@@ -401,7 +410,9 @@ fn select_symbols(args: &Args) -> Result<Vec<String>, String> {
 }
 
 fn is_header(cols: &[&str]) -> bool {
-    if cols.is_empty() { return true; }
+    if cols.is_empty() {
+        return true;
+    }
     let head = cols[0].trim().to_ascii_lowercase();
     head.starts_with("aggregate")
         || head == "agg_trade_id"
@@ -412,12 +423,13 @@ fn is_header(cols: &[&str]) -> bool {
 
 fn parse_aggtrade_row(symbol: &str, line: &str) -> Result<Option<AggTrade>, String> {
     let line = line.trim();
-    if line.is_empty() { return Ok(None); }
-
-    // Binance aggTrades rows are simple CSV values: a,p,q,f,l,T,m.
-    // No quoted fields are expected for this market-data file.
+    if line.is_empty() {
+        return Ok(None);
+    }
     let cols: Vec<&str> = line.split(',').collect();
-    if is_header(&cols) { return Ok(None); }
+    if is_header(&cols) {
+        return Ok(None);
+    }
     if cols.len() < 7 {
         return Err(format!("bad row length={} row={line:?}", cols.len()));
     }
@@ -450,7 +462,6 @@ fn json_escape(s: &str) -> String {
 }
 
 fn to_json_line(x: &AggTrade) -> String {
-    // Exactly 8 fields, exactly this order: s,a,p,q,f,l,T,m
     format!(
         "{{\"s\":\"{}\",\"a\":{},\"p\":\"{}\",\"q\":\"{}\",\"f\":{},\"l\":{},\"T\":{},\"m\":{}}}",
         json_escape(&x.s),
@@ -478,10 +489,14 @@ fn extract_json_i64(line: &str, key: &str) -> Option<i64> {
     let rest = &line[start..];
     let mut end = 0usize;
     for (i, ch) in rest.char_indices() {
-        if !(ch == '-' || ch.is_ascii_digit()) { break; }
+        if !(ch == '-' || ch.is_ascii_digit()) {
+            break;
+        }
         end = i + ch.len_utf8();
     }
-    if end == 0 { return None; }
+    if end == 0 {
+        return None;
+    }
     rest[..end].parse::<i64>().ok()
 }
 
@@ -526,7 +541,9 @@ fn process_zip(
         let line = line.map_err(|e| format!("read unzip line failed: {e}"))?;
         let Some(item) = parse_aggtrade_row(symbol, &line)? else { continue; };
         let key = (item.s.clone(), item.a);
-        if seen.contains(&key) { continue; }
+        if seen.contains(&key) {
+            continue;
+        }
 
         writeln!(out, "{}", to_json_line(&item)).map_err(|e| format!("write output failed: {e}"))?;
         seen.insert(key);
@@ -543,7 +560,6 @@ fn process_zip(
     if !status.success() && !hit_limit {
         return Err(format!("unzip failed for {:?}: status={status}", zip_path));
     }
-
     Ok((day_count, hit_limit))
 }
 
@@ -551,6 +567,8 @@ fn run() -> Result<(), String> {
     let args = parse_args()?;
     let symbols = select_symbols(&args)?;
     let days = date_range(&args.start, &args.end)?;
+
+    println!("[CONFIG] mode={} start={} end={} out={:?}", if args.all_assets { "all-assets" } else { "selected" }, args.start, args.end, args.out);
 
     fs::create_dir_all(&args.tmp_dir).map_err(|e| format!("create tmp dir failed {:?}: {e}", args.tmp_dir))?;
 
@@ -588,20 +606,13 @@ fn run() -> Result<(), String> {
                 continue;
             }
 
-            let (day_count, hit_limit) = process_zip(
-                &symbol,
-                &zip_path,
-                &mut out_file,
-                &mut seen,
-                &mut total,
-                args.max_rows,
-            )?;
+            let (day_count, hit_limit) = process_zip(&symbol, &zip_path, &mut out_file, &mut seen, &mut total, args.max_rows)?;
             symbol_rows += day_count;
-
             println!("[OK] {symbol} {day} rows={day_count}");
 
-            if !args.keep_zip { let _ = fs::remove_file(&zip_path); }
-
+            if !args.keep_zip {
+                let _ = fs::remove_file(&zip_path);
+            }
             if hit_limit {
                 println!("[DONE] max rows reached: {total}");
                 return Ok(());
