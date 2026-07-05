@@ -1,3 +1,5 @@
+# GitHub Actions runner for tick.rs
+# Push event runs a 1-symbol smoke check. Schedule/manual can run all assets for yesterday UTC.
 name: tick-loader
 
 on:
@@ -76,7 +78,7 @@ jobs:
           ARGS="--out ${OUT_FILE} --resume"
 
           if [[ "${{ github.event_name }}" == "push" ]]; then
-            # Push run is a safe smoke test so we can verify compile + network + parsing quickly.
+            # Safe smoke check: verify compile + network + parsing without downloading every asset.
             ARGS="$ARGS --all-assets --max-symbols 1"
           elif [[ "${{ github.event_name }}" == "schedule" ]]; then
             # Scheduled run: production default = all assets, yesterday UTC.
