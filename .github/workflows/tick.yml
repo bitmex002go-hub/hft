@@ -1,0 +1,183 @@
+name: tick-loader
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode: smoke or all"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - smoke
+          - all
+      symbols:
+        description: "Optional comma-separated symbols. Empty = all assets"
+        required: false
+        default: ""
+      start:
+        description: "Optional YYYY-MM-DD. Empty = yesterday UTC"
+        required: false
+        default: ""
+      end:
+        description: "Optional YYYY-MM-DD. Empty = start or yesterday UTC"
+        required: false
+        default: ""
+      max_symbols:
+        description: "0 = unlimited. Useful for smoke tests"
+        required: false
+        default: "0"
+      verify:
+        description: "Verify Binance .CHECKSUM when available"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "35 3 * * *"
+  push:
+    paths:
+      - "tick.rs"
+      - ".github/workflows/tick.yml"
+
+permissions:
+  contents: read
+
+env:
+  OUT_FILE: input-bn.txt
+
+jobs:
+  tick:
+    name: compile-and-run-tick
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl unzip coreutils
+
+      - name: Compile tick.rs
+        run: |
+          rustc --version
+          rustc tick.rs -O -o tick
+          ./tick --help >/tmp/tick-help.txt || true
+          head -80 /tmp/tick-help.txt || true
+
+      - name: Resolve run arguments
+        id: args
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ARGS="--out ${OUT_FILE} --resume"
+
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            # Push run is a safe smoke test so we can verify compile + network + parsing quickly.
+            ARGS="$ARGS --all-assets --max-symbols 1"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            # Scheduled run: production default = all assets, yesterday UTC.
+            ARGS="$ARGS --all-assets"
+          else
+            MODE="${{ github.event.inputs.mode }}"
+            SYMBOLS="${{ github.event.inputs.symbols }}"
+            START="${{ github.event.inputs.start }}"
+            END="${{ github.event.inputs.end }}"
+            MAX_SYMBOLS="${{ github.event.inputs.max_symbols }}"
+            VERIFY="${{ github.event.inputs.verify }}"
+
+            if [[ -n "$SYMBOLS" ]]; then
+              ARGS="$ARGS --symbols $SYMBOLS"
+            else
+              ARGS="$ARGS --all-assets"
+            fi
+
+            if [[ "$MODE" == "smoke" && "$MAX_SYMBOLS" == "0" ]]; then
+              MAX_SYMBOLS="1"
+            fi
+
+            if [[ -n "$START" ]]; then
+              ARGS="$ARGS --start $START"
+            fi
+            if [[ -n "$END" ]]; then
+              ARGS="$ARGS --end $END"
+            fi
+            if [[ "$MAX_SYMBOLS" != "0" ]]; then
+              ARGS="$ARGS --max-symbols $MAX_SYMBOLS"
+            fi
+            if [[ "$VERIFY" == "true" ]]; then
+              ARGS="$ARGS --verify"
+            fi
+          fi
+
+          echo "args=$ARGS" >> "$GITHUB_OUTPUT"
+          echo "Resolved: ./tick $ARGS"
+
+      - name: Run tick loader
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./tick ${{ steps.args.outputs.args }}
+
+      - name: Validate output schema
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -s "$OUT_FILE" ]]; then
+            echo "ERROR: output file is missing or empty: $OUT_FILE" >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["OUT_FILE"])
+          required = ["s", "a", "p", "q", "f", "l", "T", "m"]
+          n = 0
+          symbols = set()
+
+          with path.open("r", encoding="utf-8") as f:
+              for line_no, line in enumerate(f, 1):
+                  line = line.strip()
+                  if not line:
+                      continue
+                  obj = json.loads(line)
+                  keys = list(obj.keys())
+                  if keys != required:
+                      raise SystemExit(f"bad keys at line {line_no}: {keys}")
+                  if not isinstance(obj["s"], str): raise SystemExit(f"bad s at {line_no}")
+                  if not isinstance(obj["a"], int): raise SystemExit(f"bad a at {line_no}")
+                  if not isinstance(obj["p"], str): raise SystemExit(f"bad p at {line_no}")
+                  if not isinstance(obj["q"], str): raise SystemExit(f"bad q at {line_no}")
+                  if not isinstance(obj["f"], int): raise SystemExit(f"bad f at {line_no}")
+                  if not isinstance(obj["l"], int): raise SystemExit(f"bad l at {line_no}")
+                  if not isinstance(obj["T"], int): raise SystemExit(f"bad T at {line_no}")
+                  if not isinstance(obj["m"], bool): raise SystemExit(f"bad m at {line_no}")
+                  n += 1
+                  symbols.add(obj["s"])
+
+          if n == 0:
+              raise SystemExit("no JSONL rows found")
+
+          print(f"validated rows={n} symbols={len(symbols)} file={path}")
+          PY
+
+      - name: Compress output
+        run: |
+          gzip -9 -c "$OUT_FILE" > "${OUT_FILE}.gz"
+          ls -lh "$OUT_FILE" "${OUT_FILE}.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binance-aggtrades-jsonl
+          path: |
+            input-bn.txt
+            input-bn.txt.gz
+          retention-days: 7
